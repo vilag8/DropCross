@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="it">
 <head>
@@ -200,14 +201,26 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
     const t=$('copy-toast'); t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1500);
   };
 
+  const ICE_SERVERS = [
+    {urls:'stun:stun.l.google.com:19302'},
+    {urls:'stun:stun1.l.google.com:19302'},
+    {urls:'turn:eu-0.turn.peerjs.com:3478', username:'peerjs', credential:'peerjsp'},
+    {urls:'turn:us-0.turn.peerjs.com:3478', username:'peerjs', credential:'peerjsp'},
+    {urls:'turn:openrelay.metered.ca:80', username:'openrelayproject', credential:'openrelayproject'},
+    {urls:'turn:openrelay.metered.ca:443', username:'openrelayproject', credential:'openrelayproject'},
+    {urls:'turns:openrelay.metered.ca:443', username:'openrelayproject', credential:'openrelayproject'}
+  ];
+
   function init() {
     myCode = genCode();
-    peer = new Peer('dropcross-'+myCode.toLowerCase(), {
-      config: { iceServers: [
-        {urls:'stun:stun.l.google.com:19302'},
-        {urls:'stun:stun1.l.google.com:19302'}
-      ]}
-    });
+    try {
+      peer = new Peer('dropcross-'+myCode.toLowerCase(), {
+        config: { iceServers: ICE_SERVERS }
+      });
+    } catch(e) {
+      setStatus('recv-status','error','⚠️ Connessione al server non riuscita. Scarica il file e aprilo in un browser.');
+      return;
+    }
 
     peer.on('open', () => {
       $('my-code').textContent = myCode.slice(0,3)+'·'+myCode.slice(3);
@@ -216,6 +229,9 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
 
     peer.on('error', err => {
       if(err.type==='unavailable-id'){myCode=genCode();peer.destroy();setTimeout(init,300);}
+      else if(err.type==='network'||err.type==='socket-error'||err.type==='socket-closed'){
+        setStatus('recv-status','error','⚠️ Connessione al server non riuscita. Scarica il file HTML e aprilo in un browser.');
+      }
       else setStatus('recv-status','error','Errore: '+err.message);
     });
 
@@ -316,12 +332,16 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
 
     const target = 'dropcross-'+code.toLowerCase();
 
-    const senderPeer = new Peer(undefined, {
-      config: { iceServers: [
-        {urls:'stun:stun.l.google.com:19302'},
-        {urls:'stun:stun1.l.google.com:19302'}
-      ]}
-    });
+    let senderPeer;
+    try {
+      senderPeer = new Peer(undefined, {
+        config: { iceServers: ICE_SERVERS }
+      });
+    } catch(e) {
+      btn.disabled=false; btn.textContent='Connetti';
+      setStatus('send-status','error','⚠️ Connessione non riuscita. Scarica il file e aprilo in un browser.');
+      return;
+    }
 
     senderPeer.on('open', () => {
       const c = senderPeer.connect(target, {reliable:true});
