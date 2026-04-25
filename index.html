@@ -201,21 +201,51 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
     const t=$('copy-toast'); t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1500);
   };
 
-  const ICE_SERVERS = [
-    {urls:'stun:stun.l.google.com:19302'},
-    {urls:'stun:stun1.l.google.com:19302'},
-    {urls:'turn:eu-0.turn.peerjs.com:3478', username:'peerjs', credential:'peerjsp'},
-    {urls:'turn:us-0.turn.peerjs.com:3478', username:'peerjs', credential:'peerjsp'},
-    {urls:'turn:openrelay.metered.ca:80', username:'openrelayproject', credential:'openrelayproject'},
-    {urls:'turn:openrelay.metered.ca:443', username:'openrelayproject', credential:'openrelayproject'},
-    {urls:'turns:openrelay.metered.ca:443', username:'openrelayproject', credential:'openrelayproject'}
-  ];
+  // ── Dynamic TURN credential generation (Metered.ca static auth) ──
+  async function getIceServers() {
+    const stun = [
+      {urls:'stun:stun.l.google.com:19302'},
+      {urls:'stun:stun1.l.google.com:19302'},
+      {urls:'stun:stun2.l.google.com:19302'},
+      {urls:'stun:stun3.l.google.com:19302'},
+      {urls:'stun:stun4.l.google.com:19302'}
+    ];
+    try {
+      // Generate time-limited TURN credentials using HMAC-SHA1 (RFC 5389 static auth)
+      const secret = 'openrelayprojectsecret';
+      const ts = Math.floor(Date.now()/1000) + 24*3600; // 24h expiry
+      const username = ts + ':dropcross';
+      const enc = new TextEncoder();
+      const key = await crypto.subtle.importKey('raw', enc.encode(secret), {name:'HMAC',hash:'SHA-1'}, false, ['sign']);
+      const sig = await crypto.subtle.sign('HMAC', key, enc.encode(username));
+      const credential = btoa(String.fromCharCode(...new Uint8Array(sig)));
+      return [
+        ...stun,
+        {urls:'turn:staticauth.openrelay.metered.ca:80', username, credential},
+        {urls:'turn:staticauth.openrelay.metered.ca:443', username, credential},
+        {urls:'turns:staticauth.openrelay.metered.ca:443', username, credential},
+        {urls:'turn:eu-0.turn.peerjs.com:3478', username:'peerjs', credential:'peerjsp'},
+        {urls:'turn:us-0.turn.peerjs.com:3478', username:'peerjs', credential:'peerjsp'}
+      ];
+    } catch(e) {
+      // Fallback if SubtleCrypto unavailable (e.g. non-HTTPS)
+      return [
+        ...stun,
+        {urls:'turn:eu-0.turn.peerjs.com:3478', username:'peerjs', credential:'peerjsp'},
+        {urls:'turn:us-0.turn.peerjs.com:3478', username:'peerjs', credential:'peerjsp'}
+      ];
+    }
+  }
 
-  function init() {
+  let cachedIce = null;
+  async function ice() { if(!cachedIce) cachedIce = await getIceServers(); return cachedIce; }
+
+  async function init() {
     myCode = genCode();
+    const iceServers = await ice();
     try {
       peer = new Peer('dropcross-'+myCode.toLowerCase(), {
-        config: { iceServers: ICE_SERVERS }
+        config: { iceServers }
       });
     } catch(e) {
       setStatus('recv-status','error','⚠️ Connessione al server non riuscita. Scarica il file e aprilo in un browser.');
@@ -233,6 +263,14 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
         setStatus('recv-status','error','⚠️ Connessione al server non riuscita. Scarica il file HTML e aprilo in un browser.');
       }
       else setStatus('recv-status','error','Errore: '+err.message);
+    });
+
+    peer.on('disconnected', () => {
+      // Auto-reconnect receiver if signaling server disconnects
+      if(peer && !peer.destroyed) {
+        setStatus('recv-status','info','Riconnessione al server...');
+        setTimeout(() => { try { peer.reconnect(); } catch(e){} }, 1000);
+      }
     });
 
     peer.on('connection', handleIncoming);
@@ -321,64 +359,86 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
     setStatus('recv-status','success',`🎉 Sbloccati! ${receivedBlobs.length} file pronti per il download`);
   };
 
-  // ── Connect as sender ──
-  window.connectPeer = () => {
+  // ── Connect as sender (with retry logic) ──
+  window.connectPeer = async () => {
     const code = $('peer-code').value.replace(/[^A-Za-z0-9]/g,'').toUpperCase();
     if(code.length!==6){setStatus('send-status','error','Inserisci 6 caratteri');return;}
 
     const btn=$('btn-connect');
-    btn.disabled=true; btn.textContent='Connessione...';
-    setStatus('send-status','info','Connessione in corso...');
-
+    btn.disabled=true;
     const target = 'dropcross-'+code.toLowerCase();
+    const iceServers = await ice();
+    const MAX_RETRIES = 3;
+    const TIMEOUTS = [10000, 15000, 20000];
 
-    let senderPeer;
-    try {
-      senderPeer = new Peer(undefined, {
-        config: { iceServers: ICE_SERVERS }
+    for(let attempt=0; attempt < MAX_RETRIES; attempt++) {
+      btn.textContent = attempt > 0 ? 'Tentativo '+(attempt+1)+'/'+MAX_RETRIES+'...' : 'Connessione...';
+      setStatus('send-status','info', attempt > 0 ? 'Tentativo '+(attempt+1)+' di '+MAX_RETRIES+'...' : 'Connessione in corso...');
+
+      const result = await new Promise(resolve => {
+        let senderPeer;
+        try {
+          senderPeer = new Peer(undefined, { config: { iceServers } });
+        } catch(e) {
+          resolve('fail');
+          return;
+        }
+
+        let settled = false;
+        const tout = setTimeout(() => {
+          if(!settled){ settled=true; try{senderPeer.destroy();}catch(e){} resolve('retry'); }
+        }, TIMEOUTS[attempt]);
+
+        senderPeer.on('open', () => {
+          const c = senderPeer.connect(target, {reliable:true});
+
+          c.on('open', () => {
+            if(settled) return;
+            clearTimeout(tout); settled=true;
+            conn = c;
+
+            c.on('data', d => {
+              if(d.t==='ok') {
+                btn.textContent='✓ Connesso';btn.style.background='var(--ok)';
+                $('file-card').style.display='block';
+                setStatus('send-status','success','Connesso! Seleziona i file.');
+              }
+              else if(d.t==='ack'){/* file received */}
+            });
+
+            c.on('close', () => {
+              conn=null;btn.disabled=false;btn.textContent='Connetti';btn.style.background='';
+              setStatus('send-status','waiting','Disconnesso.');
+            });
+
+            resolve('ok');
+          });
+
+          c.on('error', () => {
+            if(!settled){ settled=true; clearTimeout(tout); try{senderPeer.destroy();}catch(e){} resolve('retry'); }
+          });
+        });
+
+        senderPeer.on('error', err => {
+          if(!settled){
+            settled=true; clearTimeout(tout);
+            if(err.type==='peer-unavailable') resolve('not-found');
+            else resolve('retry');
+          }
+        });
       });
-    } catch(e) {
-      btn.disabled=false; btn.textContent='Connetti';
-      setStatus('send-status','error','⚠️ Connessione non riuscita. Scarica il file e aprilo in un browser.');
-      return;
+
+      if(result === 'ok') return;
+      if(result === 'not-found') {
+        btn.disabled=false;btn.textContent='Connetti';
+        setStatus('send-status','error','Codice non trovato. Verifica che il ricevente sia online e riprova.');
+        return;
+      }
+      if(attempt < MAX_RETRIES - 1) await new Promise(r => setTimeout(r, 1500));
     }
 
-    senderPeer.on('open', () => {
-      const c = senderPeer.connect(target, {reliable:true});
-      const timeout = setTimeout(()=>{
-        c.close();btn.disabled=false;btn.textContent='Connetti';
-        setStatus('send-status','error','Codice non trovato. Verifica e riprova.');
-      },12000);
-
-      c.on('open', () => {
-        clearTimeout(timeout);
-        conn = c;
-
-        c.on('data', d => {
-          if(d.t==='ok') {
-            btn.textContent='✓ Connesso';btn.style.background='var(--ok)';
-            $('file-card').style.display='block';
-            setStatus('send-status','success','Connesso! Seleziona i file.');
-          }
-          else if(d.t==='ack'){/* file received */}
-        });
-
-        c.on('close', () => {
-          conn=null;btn.disabled=false;btn.textContent='Connetti';btn.style.background='';
-          setStatus('send-status','waiting','Disconnesso.');
-        });
-      });
-
-      c.on('error', () => {
-        clearTimeout(timeout);btn.disabled=false;btn.textContent='Connetti';
-        setStatus('send-status','error','Errore di connessione.');
-      });
-    });
-
-    senderPeer.on('error', err => {
-      btn.disabled=false;btn.textContent='Connetti';
-      setStatus('send-status','error','Errore: '+err.message);
-    });
+    btn.disabled=false;btn.textContent='Connetti';
+    setStatus('send-status','error','Connessione non riuscita dopo 3 tentativi. Verifica la rete e riprova.');
   };
 
   // ── File handling ──
