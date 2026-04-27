@@ -5,6 +5,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>DropCross — File Transfer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%236c5ce7'/><text x='50' y='68' font-size='60' text-anchor='middle' fill='white'>⚡</text></svg>">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -42,7 +43,7 @@ header{text-align:center;padding:20px 0 10px}
 .input:focus{border-color:var(--ac)}
 .input::placeholder{color:var(--tx3)}
 .input.code-input{font-family:"SF Mono",Monaco,monospace;font-size:1.3rem;letter-spacing:.15em;text-transform:uppercase;text-align:center}
-.btn{padding:12px 20px;border-radius:var(--radius-sm);font-weight:600;font-size:.9rem;cursor:pointer;border:none;transition:all .2s;display:inline-flex;align-items:center;justify-content:center;gap:8px}
+.btn{padding:12px 20px;border-radius:var(--radius-sm);font-weight:600;font-size:.9rem;cursor:pointer;border:none;transition:all .2s;display:inline-flex;align-items:center;justify-content:center;gap:8px;flex-shrink:0}
 .btn:active{transform:scale(.97)}
 .btn-primary{background:var(--ac);color:#fff;box-shadow:0 2px 12px var(--ac-glow)}
 .btn-primary:hover{background:#5b4bd6}
@@ -82,7 +83,7 @@ header{text-align:center;padding:20px 0 10px}
 .speed-badge{font-size:.7rem;color:var(--tx3);background:var(--bg2);padding:3px 8px;border-radius:10px}
 footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
 ::-webkit-scrollbar{width:4px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--bg3);border-radius:2px}
-@media(max-width:400px){.code-display{font-size:1.8rem}.card{padding:16px}}
+@media(max-width:480px){.code-display{font-size:1.8rem}.card{padding:16px}.connect-group{flex-direction:column}.connect-group .btn{width:100%}.input.code-input{font-size:1.1rem;letter-spacing:.1em}}
 </style>
 </head>
 <body>
@@ -124,7 +125,7 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
   <div id="panel-send" style="display:none">
     <div class="card">
       <div class="card-title"><span class="icon">🔗</span> Connettiti</div>
-      <div class="input-group">
+      <div class="input-group connect-group">
         <input class="input code-input" id="peer-code" placeholder="ABC123" maxlength="6" autocomplete="off" spellcheck="false">
         <button class="btn btn-primary" onclick="connectPeer()" id="btn-connect">Connetti</button>
       </div>
