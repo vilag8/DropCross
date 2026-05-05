@@ -115,15 +115,6 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
       </div>
     </div>
     <div id="recv-status"></div>
-<div class="card" id="recv-storage-card">
- <div class="card-title"><span class="icon">💾</span> Salvataggio file grandi</div>
- <div style="display:flex;gap:8px;flex-wrap:wrap">
-  <button class="btn btn-secondary btn-sm" id="btn-pick-folder" onclick="pickSaveFolder()">Scegli cartella</button>
-  <button class="btn btn-secondary btn-sm" id="btn-clear-folder" onclick="clearSaveFolder()" style="display:none">Usa memoria</button>
- </div>
- <div class="muted-note" id="save-folder-status" style="margin-top:10px">Modalità standard: i file vengono tenuti in memoria fino al download. Su browser compatibili puoi scegliere una cartella per salvare direttamente i file non protetti e, per i file protetti, archiviare temporaneamente i dati cifrati su disco riducendo l'uso di RAM.</div>
- <div id="save-folder-path"></div>
-</div>
 <button class="btn btn-danger btn-full" id="btn-cancel-recv" onclick="cancelTransfer('receiver')" style="display:none">⛔ Annulla ricezione</button>
     <div id="pw-unlock" style="display:none" class="card">
       <div class="card-title"><span class="icon">🔒</span> File protetti da password</div>
@@ -196,8 +187,11 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
 </script>
 <script>
 (function(){
- const CHUNK = 32 * 1024;
- const MAX_BUFFERED_AMOUNT = 256 * 1024;
+ const DEFAULT_CHUNK = 16000;
+ const MIN_CHUNK = 4096;
+ const CHUNK_MARGIN = 2048;
+ const DC_BUFFER_HIGH_WATER = 512 * 1024;
+ const DC_BUFFER_LOW_WATER = 128 * 1024;
  const PBKDF2_ITERATIONS = 150000;
  const PBKDF2_HASH = 'SHA-256';
  const CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -206,20 +200,29 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
   {urls:'stun:stun1.l.google.com:19302'},
   {urls:'stun:stun2.l.google.com:19302'},
   {urls:'stun:stun3.l.google.com:19302'},
-  {urls:'stun:stun4.l.google.com:19302'}
+  {urls:'stun:stun4.l.google.com:19302'},
+  {urls:'stun:stun.cloudflare.com:3478'}
  ];
  const OPTIONAL_TURN = [
-  {urls:'turn:eu-0.turn.peerjs.com:3478', username:'peerjs', credential:'peerjsp'},
-  {urls:'turn:us-0.turn.peerjs.com:3478', username:'peerjs', credential:'peerjsp'}
+  {urls:['turn:eu-0.turn.peerjs.com:3478?transport=udp','turn:eu-0.turn.peerjs.com:3478?transport=tcp'], username:'peerjs', credential:'peerjsp'},
+  {urls:['turn:us-0.turn.peerjs.com:3478?transport=udp','turn:us-0.turn.peerjs.com:3478?transport=tcp'], username:'peerjs', credential:'peerjsp'}
  ];
+ const COMPRESSIBLE_EXT = new Set(['txt','md','csv','tsv','json','xml','html','htm','css','js','mjs','cjs','jsx','ts','tsx','svg','log','ini','cfg','yaml','yml','sql']);
+ const COMPRESSIBLE_MIME_RE = /^(text\/|application\/(json|xml|javascript|x-javascript|ecmascript|x-www-form-urlencoded)|image\/svg\+xml)/i;
+ const MAX_COMPRESS_FILE_SIZE = 16 * 1024 * 1024;
+ const MIN_COMPRESS_SIZE = 1024;
+ const TEXT_COMPRESS_THRESHOLD = 768;
+ const peerCtor = window.Peer || (window.peerjs && window.peerjs.Peer);
 
  let peer = null, myCode = '', files = [], conn = null, sendPeer = null;
  let incomingQueue = Promise.resolve();
- let saveDirHandle = null;
  let currentIncoming = null;
  let pendingAcks = new Map();
  let ignoreIncomingBinary = false;
  let sendMode = 'file';
+ let incomingCancelRequested = false;
+ let senderReady = false;
+
  const ua = navigator.userAgent || '';
  const isIOS = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
  const isSafari = /Safari/i.test(ua) && !/Chrome|CriOS|Edg|OPR|Firefox|FxiOS|SamsungBrowser/i.test(ua);
@@ -237,10 +240,14 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
   startedAt:0,
   currentFileId:null,
   currentFileName:'',
-  currentRole:null
+  currentRole:null,
+  chunkSize:DEFAULT_CHUNK
  };
 
+ const textEncoder = new TextEncoder();
+ const textDecoder = new TextDecoder();
  const $ = id => document.getElementById(id);
+
  const genCode = (n=6) => {
   const a = crypto.getRandomValues(new Uint8Array(n));
   return Array.from(a, v => CHARS[v % CHARS.length]).join('');
@@ -249,17 +256,72 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
  const fmtSpeed = b => b < 1024 ? b.toFixed(0) + ' B/s' : b < 1048576 ? (b/1024).toFixed(0) + ' KB/s' : (b/1048576).toFixed(1) + ' MB/s';
  const fileIcon = n => {
   const ext = ((n || '').split('.').pop() || '').toLowerCase();
-  return ({pdf:'📄',doc:'📝',docx:'📝',txt:'📝',jpg:'🖼️',jpeg:'🖼️',png:'🖼️',gif:'🖼️',webp:'🖼️',mp4:'🎬',mov:'🎬',mkv:'🎬',mp3:'🎵',wav:'🎵',zip:'📦',rar:'📦'})[ext] || '📎';
+  return ({pdf:'📄',doc:'📝',docx:'📝',txt:'📝',md:'📝',jpg:'🖼️',jpeg:'🖼️',png:'🖼️',gif:'🖼️',webp:'🖼️',svg:'🖼️',mp4:'🎬',mov:'🎬',mkv:'🎬',mp3:'🎵',wav:'🎵',zip:'📦',rar:'📦',csv:'📊',json:'🧾'})[ext] || '📎';
  };
- const textEncoder = new TextEncoder();
- const textDecoder = new TextDecoder();
-
  function clearChildren(el){ while(el && el.firstChild) el.removeChild(el.firstChild); }
  function safeText(value){ return value == null ? '' : String(value); }
  function toArrayBuffer(value){
   if(value instanceof ArrayBuffer) return value;
   if(ArrayBuffer.isView(value)) return value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
   return value;
+ }
+ function extOf(name){ const parts = safeText(name).split('.'); return parts.length > 1 ? parts.pop().toLowerCase() : ''; }
+ function supportsCompression(){ return typeof CompressionStream !== 'undefined' && typeof DecompressionStream !== 'undefined'; }
+ function clamp(n, min, max){ return Math.max(min, Math.min(max, n)); }
+ function chunkCountFor(size, chunkSize){ return Math.ceil(size / chunkSize); }
+ function computeEncryptedTransferBytes(size, chunkSize){ return size + 16 * chunkCountFor(size, chunkSize); }
+ function plainChunkLength(fileSize, chunkSize, index){
+  const start = index * chunkSize;
+  return Math.max(0, Math.min(chunkSize, fileSize - start));
+ }
+ function cipherChunkLength(fileSize, chunkSize, index){ return plainChunkLength(fileSize, chunkSize, index) + 16; }
+ function makeUniqueId() { return 'f_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2,8); }
+ function makeIvBase(){ return crypto.getRandomValues(new Uint8Array(8)); }
+ function makeIvFromBase(ivBase, counter) {
+  const iv = new Uint8Array(12);
+  iv.set(ivBase, 0);
+  new DataView(iv.buffer).setUint32(8, counter, false);
+  return iv;
+ }
+ function getPeerJsChunkLimit(c) {
+  const limit = c && c.chunker && Number(c.chunker.chunkedMTU);
+  return Number.isFinite(limit) && limit > 0 ? limit : 16300;
+ }
+ function getSctpMaxMessageSize(c) {
+  const size = c && c.peerConnection && c.peerConnection.sctp && Number(c.peerConnection.sctp.maxMessageSize);
+  return Number.isFinite(size) && size > 0 ? size : Number.POSITIVE_INFINITY;
+ }
+ function computeTransferChunkSize(c) {
+  const peerLimit = Math.max(MIN_CHUNK, getPeerJsChunkLimit(c) - 256);
+  const sctpLimit = Math.max(MIN_CHUNK, getSctpMaxMessageSize(c) - CHUNK_MARGIN);
+  const base = Math.min(DEFAULT_CHUNK, peerLimit, sctpLimit);
+  return clamp(base, MIN_CHUNK, DEFAULT_CHUNK);
+ }
+ function tuneConnection(c) {
+  if(!c) return DEFAULT_CHUNK;
+  const chunkSize = computeTransferChunkSize(c);
+  c.__dropcrossChunkSize = chunkSize;
+  try {
+   if(c.chunker && c.chunker.chunkedMTU && c.chunker.chunkedMTU > chunkSize) c.chunker.chunkedMTU = chunkSize;
+  } catch(e) {}
+  try {
+   if(c.dataChannel) {
+    c.dataChannel.binaryType = 'arraybuffer';
+    c.dataChannel.bufferedAmountLowThreshold = DC_BUFFER_LOW_WATER;
+   }
+  } catch(e) {}
+  transfer.chunkSize = chunkSize;
+  return chunkSize;
+ }
+ function getActiveChunkSize(){ return conn ? (conn.__dropcrossChunkSize || computeTransferChunkSize(conn)) : DEFAULT_CHUNK; }
+ function createPeerConfig(){
+  return {
+   config: {
+    iceServers: [...STUN_SERVERS, ...OPTIONAL_TURN],
+    iceCandidatePoolSize: 8,
+    sdpSemantics: 'unified-plan'
+   }
+  };
  }
  function setStatus(id, type, msg) {
   const host = $(id);
@@ -320,22 +382,36 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
   const elapsed = (Date.now() - transfer.startedAt) / 1000;
   if(elapsed > 0.2) $('prog-speed').textContent = fmtSpeed(sent / elapsed);
  }
- function makeUniqueId() {
-  return 'f_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2,8);
+ function renderFiles() {
+  const el = $('file-list');
+  const btn = $('btn-send');
+  clearChildren(el);
+  files.forEach((f, i) => {
+   const item = document.createElement('div');
+   item.className = 'file-item';
+   const icon = document.createElement('span');
+   icon.textContent = fileIcon(f.name);
+   const name = document.createElement('span');
+   name.className = 'name';
+   name.textContent = f.name;
+   const size = document.createElement('span');
+   size.className = 'size';
+   size.textContent = fmtSize(f.size);
+   const remove = document.createElement('span');
+   remove.className = 'remove';
+   remove.textContent = '✕';
+   remove.addEventListener('click', () => window.removeFile(i));
+   item.append(icon, name, size, remove);
+   el.appendChild(item);
+  });
+  btn.style.display = files.length ? 'flex' : 'none';
+  if(files.length) {
+   const total = files.reduce((s, f) => s + f.size, 0);
+   btn.textContent = `🚀 Invia ${files.length} file (${fmtSize(total)})`;
+  } else {
+   btn.textContent = '🚀 Invia';
+  }
  }
- function makeIvBase(){ return crypto.getRandomValues(new Uint8Array(8)); }
- function makeIvFromBase(ivBase, counter) {
-  const iv = new Uint8Array(12);
-  iv.set(ivBase, 0);
-  new DataView(iv.buffer).setUint32(8, counter, false);
-  return iv;
- }
- function chunkCountFor(size, chunkSize){ return Math.ceil(size / chunkSize); }
- function plainChunkLength(fileSize, chunkSize, index){
-  const start = index * chunkSize;
-  return Math.max(0, Math.min(chunkSize, fileSize - start));
- }
- function cipherChunkLength(fileSize, chunkSize, index){ return plainChunkLength(fileSize, chunkSize, index) + 16; }
  async function deriveKeyFromPassword(password, salt, iterations = PBKDF2_ITERATIONS){
   const baseKey = await crypto.subtle.importKey('raw', textEncoder.encode(password), {name:'PBKDF2'}, false, ['deriveKey']);
   return crypto.subtle.deriveKey({name:'PBKDF2', salt, iterations, hash:PBKDF2_HASH}, baseKey, {name:'AES-GCM', length:256}, false, ['encrypt','decrypt']);
@@ -348,14 +424,63 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
   const iv = makeIvFromBase(ivBase, counter);
   return crypto.subtle.decrypt({name:'AES-GCM', iv}, key, buffer);
  }
- async function encryptTextPayload(key, text) {
+ async function encryptBufferPayload(key, buffer) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const cipher = await crypto.subtle.encrypt({name:'AES-GCM', iv}, key, textEncoder.encode(text));
+  const cipher = await crypto.subtle.encrypt({name:'AES-GCM', iv}, key, buffer);
   return {iv, cipher};
  }
- async function decryptTextPayload(key, iv, cipher) {
-  const plain = await crypto.subtle.decrypt({name:'AES-GCM', iv}, key, cipher);
-  return textDecoder.decode(plain);
+ async function decryptBufferPayload(key, iv, cipher) {
+  return crypto.subtle.decrypt({name:'AES-GCM', iv}, key, cipher);
+ }
+ async function compressBlobGzip(blob) {
+  const stream = blob.stream().pipeThrough(new CompressionStream('gzip'));
+  return new Response(stream).blob();
+ }
+ async function decompressBlobGzip(blob) {
+  const stream = blob.stream().pipeThrough(new DecompressionStream('gzip'));
+  return new Response(stream).blob();
+ }
+ async function gzipBytes(buffer) {
+  const blob = new Blob([buffer]);
+  return (await compressBlobGzip(blob)).arrayBuffer();
+ }
+ async function gunzipBytes(buffer) {
+  const blob = new Blob([buffer]);
+  return (await decompressBlobGzip(blob)).arrayBuffer();
+ }
+ function isCompressibleFile(file) {
+  if(!supportsCompression()) return false;
+  const size = Number(file && file.size || 0);
+  if(size < MIN_COMPRESS_SIZE || size > MAX_COMPRESS_FILE_SIZE) return false;
+  const name = safeText(file && file.name);
+  const ext = extOf(name);
+  const type = safeText(file && file.type);
+  return COMPRESSIBLE_EXT.has(ext) || COMPRESSIBLE_MIME_RE.test(type);
+ }
+ async function maybeCompressFile(file) {
+  if(!isCompressibleFile(file)) return {blob:file, cmp:null, payloadSize:file.size};
+  try {
+   const gzBlob = await compressBlobGzip(file);
+   if(gzBlob.size + 64 < file.size * 0.97) return {blob:gzBlob, cmp:'gzip', payloadSize:gzBlob.size};
+  } catch(e) {}
+  return {blob:file, cmp:null, payloadSize:file.size};
+ }
+ async function maybeCompressTextBuffer(buffer) {
+  if(!supportsCompression() || buffer.byteLength < TEXT_COMPRESS_THRESHOLD) return {buffer, cmp:null};
+  try {
+   const gz = await gzipBytes(buffer);
+   if(gz.byteLength + 24 < buffer.byteLength * 0.97) return {buffer:gz, cmp:'gzip'};
+  } catch(e) {}
+  return {buffer, cmp:null};
+ }
+ async function maybeDecompressBlob(blob, cmp, mime) {
+  if(cmp !== 'gzip') return new Blob([blob], {type:mime || blob.type || 'application/octet-stream'});
+  const out = await decompressBlobGzip(blob);
+  return new Blob([await out.arrayBuffer()], {type:mime || 'application/octet-stream'});
+ }
+ async function maybeDecodeTextBuffer(buffer, cmp) {
+  if(cmp === 'gzip') buffer = await gunzipBytes(buffer);
+  return textDecoder.decode(buffer);
  }
  async function blobToDataURL(blob) {
   return new Promise((resolve, reject) => {
@@ -377,7 +502,20 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
     if(err && err.name === 'AbortError') return true;
    }
   }
-  if(isSafari) {
+  try {
+   const url = URL.createObjectURL(file || blob);
+   const a = document.createElement('a');
+   a.href = url;
+   a.download = name;
+   a.rel = 'noopener';
+   a.style.display = 'none';
+   document.body.appendChild(a);
+   a.click();
+   a.remove();
+   setTimeout(() => URL.revokeObjectURL(url), isSafari ? 120000 : 30000);
+   return true;
+  } catch(err) {}
+  if(isSafari && blob.size <= 4 * 1024 * 1024) {
    try {
     const dataUrl = await blobToDataURL(file || blob);
     const a = document.createElement('a');
@@ -389,37 +527,9 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
     a.click();
     a.remove();
     return true;
-   } catch(err) {
-    try {
-     const url = URL.createObjectURL(file || blob);
-     const a = document.createElement('a');
-     a.href = url;
-     a.download = name;
-     a.rel = 'noopener';
-     a.style.display = 'none';
-     document.body.appendChild(a);
-     a.click();
-     a.remove();
-     setTimeout(() => URL.revokeObjectURL(url), 120000);
-     return true;
-    } catch(e) { return false; }
-   }
+   } catch(err) {}
   }
-  try {
-   const url = URL.createObjectURL(file || blob);
-   const a = document.createElement('a');
-   a.href = url;
-   a.download = name;
-   a.rel = 'noopener';
-   a.style.display = 'none';
-   document.body.appendChild(a);
-   a.click();
-   a.remove();
-   setTimeout(() => URL.revokeObjectURL(url), 30000);
-   return true;
-  } catch(err) {
-   return false;
-  }
+  return false;
  }
  async function prepareSendSecurity(password) {
   if(password) {
@@ -438,16 +548,16 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
   btn.addEventListener('click', async () => {
    const prev = btn.textContent;
    btn.disabled = true;
-   btn.textContent = isIOS ? 'Preparazione...' : 'Preparazione...';
+   btn.textContent = 'Preparazione...';
    const ok = await saveBlobSafely(blob, name);
    btn.disabled = false;
    btn.textContent = ok ? (isIOS ? '📤 Condividi / Salva' : '💾 Salva') : '⚠️ Riprova';
-   if(!ok) setStatus('recv-status','error','Safari ha bloccato il download. Riprova dal pulsante o usa Condividi/Salva.');
+   if(!ok) setStatus('recv-status','error','Il browser ha bloccato il download. Riprova dal pulsante o usa Condividi/Salva.');
    setTimeout(() => { btn.textContent = prev; }, 1200);
   });
   return btn;
  }
- function showFileDownload(name, size, blob, savedToDisk) {
+ function showFileDownload(name, size, blob) {
   const el = $('received-files');
   const div = document.createElement('div');
   div.className = 'received-file';
@@ -461,19 +571,12 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
   nameEl.textContent = name;
   const meta = document.createElement('div');
   meta.className = 'meta';
-  meta.textContent = savedToDisk ? (fmtSize(size) + ' · salvato su disco') : fmtSize(size) + (isSafari ? ' · compatibilità Safari attiva' : '');
+  meta.textContent = fmtSize(size) + (isSafari ? ' · compatibilità Safari attiva' : '');
   info.appendChild(nameEl);
   info.appendChild(meta);
   div.appendChild(icon);
   div.appendChild(info);
-  if(savedToDisk) {
-   const badge = document.createElement('span');
-   badge.className = 'speed-badge';
-   badge.textContent = 'Salvato';
-   div.appendChild(badge);
-  } else {
-   div.appendChild(createDownloadButton(blob, name));
-  }
+  div.appendChild(createDownloadButton(blob, name));
   el.appendChild(div);
  }
  function showReceivedText(text) {
@@ -514,41 +617,270 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
   div.appendChild(row);
   el.appendChild(div);
  }
- function renderFiles() {
-  const el = $('file-list');
-  const btn = $('btn-send');
-  clearChildren(el);
-  files.forEach((f, i) => {
-   const item = document.createElement('div');
-   item.className = 'file-item';
-   const icon = document.createElement('span');
-   icon.textContent = fileIcon(f.name);
-   const name = document.createElement('span');
-   name.className = 'name';
-   name.textContent = f.name;
-   const size = document.createElement('span');
-   size.className = 'size';
-   size.textContent = fmtSize(f.size);
-   const remove = document.createElement('span');
-   remove.className = 'remove';
-   remove.textContent = '✕';
-   remove.addEventListener('click', () => window.removeFile(i));
-   item.append(icon, name, size, remove);
-   el.appendChild(item);
+ async function waitForBufferedAmountLow(activeConn = conn) {
+  const dc = activeConn && activeConn.dataChannel;
+  if(!dc || dc.readyState !== 'open') return;
+  if(dc.bufferedAmount <= DC_BUFFER_HIGH_WATER) return;
+  await new Promise(resolve => {
+   let done = false;
+   let interval = null;
+   const cleanup = () => {
+    if(done) return;
+    done = true;
+    if(interval) clearInterval(interval);
+    if(dc.removeEventListener) dc.removeEventListener('bufferedamountlow', onLow);
+    resolve();
+   };
+   const onLow = () => {
+    if(dc.bufferedAmount <= DC_BUFFER_LOW_WATER) cleanup();
+   };
+   try { dc.bufferedAmountLowThreshold = DC_BUFFER_LOW_WATER; } catch(e) {}
+   if(dc.addEventListener) dc.addEventListener('bufferedamountlow', onLow);
+   interval = setInterval(() => {
+    if(!activeConn || !activeConn.open || transfer.cancelRequested || dc.readyState !== 'open' || dc.bufferedAmount <= DC_BUFFER_LOW_WATER) cleanup();
+   }, 200);
   });
-  btn.style.display = files.length ? 'flex' : 'none';
-  if(files.length) {
-   const total = files.reduce((s, f) => s + f.size, 0);
-   btn.textContent = `🚀 Invia ${files.length} file (${fmtSize(total)})`;
-  } else {
-   btn.textContent = '🚀 Invia';
+ }
+ function waitForAck(fileId, timeout=45000) {
+  return new Promise((resolve) => {
+   const timer = setTimeout(() => {
+    pendingAcks.delete(fileId);
+    resolve(false);
+   }, timeout);
+   pendingAcks.set(fileId, () => {
+    clearTimeout(timer);
+    pendingAcks.delete(fileId);
+    resolve(true);
+   });
+  });
+ }
+ function resolveAck(fileId) { const fn = pendingAcks.get(fileId); if(fn) fn(); }
+ async function cleanupPartialIncoming() {
+  currentIncoming = null;
+ }
+ function resetReceivedState() {
+  recvSecurity.enabled = false;
+  recvSecurity.salt = null;
+  recvSecurity.iterations = PBKDF2_ITERATIONS;
+  encryptedFileQueue.length = 0;
+  encryptedTextQueue.length = 0;
+  currentIncoming = null;
+  ignoreIncomingBinary = false;
+  incomingCancelRequested = false;
+  $('pw-unlock').style.display = 'none';
+  $('pw-error').style.display = 'none';
+  $('recv-pw-input').value = '';
+  clearChildren($('received-files'));
+  clearChildren($('received-texts'));
+ }
+ function readEncryptedChunkFromMemory(fileMeta, index) {
+  return toArrayBuffer(fileMeta.chunks[index]);
+ }
+ async function verifyPasswordForPending(key) {
+  if(encryptedTextQueue.length) {
+   const sample = encryptedTextQueue[0];
+   await decryptBufferPayload(key, sample.iv, sample.cipher);
+   return;
+  }
+  if(encryptedFileQueue.length) {
+   const sampleFile = encryptedFileQueue[0];
+   const firstChunk = readEncryptedChunkFromMemory(sampleFile, 0);
+   await decryptChunk(key, sampleFile.ivBase, 0, firstChunk);
   }
  }
- function getIceServers() { return [...STUN_SERVERS, ...OPTIONAL_TURN]; }
- async function init() {
+ async function unlockEncryptedText(key) {
+  for(const item of encryptedTextQueue) {
+   const plainBuffer = await decryptBufferPayload(key, item.iv, item.cipher);
+   const text = await maybeDecodeTextBuffer(plainBuffer, item.cmp || null);
+   showReceivedText(text);
+  }
+  encryptedTextQueue.length = 0;
+ }
+ async function unlockEncryptedFiles(key) {
+  for(const fileMeta of [...encryptedFileQueue]) {
+   const plainChunks = [];
+   for(let i = 0; i < fileMeta.totalChunks; i++) {
+    const cipherChunk = readEncryptedChunkFromMemory(fileMeta, i);
+    const plain = await decryptChunk(key, fileMeta.ivBase, i, cipherChunk);
+    plainChunks.push(new Uint8Array(plain));
+   }
+   const payloadBlob = new Blob(plainChunks, {type:fileMeta.cmp ? 'application/gzip' : (fileMeta.mime || 'application/octet-stream')});
+   const finalBlob = await maybeDecompressBlob(payloadBlob, fileMeta.cmp, fileMeta.mime);
+   showFileDownload(fileMeta.name, fileMeta.size, finalBlob);
+  }
+  encryptedFileQueue.length = 0;
+ }
+ async function finalizeIncomingFile(fileMeta) {
+  const payloadBlob = new Blob(fileMeta.chunks, {type:fileMeta.cmp ? 'application/gzip' : (fileMeta.mime || 'application/octet-stream')});
+  const finalBlob = await maybeDecompressBlob(payloadBlob, fileMeta.cmp, fileMeta.mime);
+  showFileDownload(fileMeta.name, fileMeta.size, finalBlob);
+  setStatus('recv-status','success', `✅ File ricevuto: ${fileMeta.name}`);
+ }
+ async function handleIncoming(c) {
+  conn = c;
+  senderReady = false;
+  tuneConnection(c);
+  resetReceivedState();
+  c.on('open', () => {
+   senderReady = true;
+   tuneConnection(c);
+   c.send({t:'ok'});
+   setStatus('recv-status','success','Connesso! In attesa del trasferimento...');
+  });
+  c.on('data', d => {
+   incomingQueue = incomingQueue.then(() => processIncomingData(c, d)).catch(err => {
+    console.error(err);
+    setStatus('recv-status', 'error', 'Errore durante la ricezione: ' + (err && err.message ? err.message : 'sconosciuto'));
+   });
+  });
+  c.on('close', async () => {
+   transfer.cancelRequested = false;
+   setReceivingUI(false);
+   await cleanupPartialIncoming();
+   setStatus('recv-status','waiting','Disconnesso. In attesa...');
+  });
+ }
+ async function processIncomingData(c, d) {
+  if(d instanceof Blob) d = await d.arrayBuffer();
+  if(d instanceof ArrayBuffer || ArrayBuffer.isView(d)) {
+   if(ignoreIncomingBinary || !currentIncoming) return;
+   const chunk = d instanceof ArrayBuffer ? new Uint8Array(d) : new Uint8Array(d.buffer, d.byteOffset, d.byteLength);
+   currentIncoming.received += chunk.byteLength;
+   currentIncoming.chunks.push(chunk.slice());
+   const total = currentIncoming.transferBytes || currentIncoming.payloadSize || currentIncoming.size;
+   const pct = total ? Math.min(100, Math.round((currentIncoming.received / total) * 100)) : 0;
+   setStatus('recv-status', 'info', `Ricezione: ${currentIncoming.name} — ${pct}%`);
+   return;
+  }
+  if(!d || typeof d !== 'object') return;
+  if(d.t === 'sec') {
+   recvSecurity.enabled = !!d.enabled;
+   recvSecurity.salt = d.salt ? new Uint8Array(d.salt) : null;
+   recvSecurity.iterations = d.iterations || PBKDF2_ITERATIONS;
+   if(recvSecurity.enabled) setStatus('recv-status','info','🔒 Trasferimento cifrato in arrivo...');
+   return;
+  }
+  if(d.t === 'cancel') {
+   ignoreIncomingBinary = true;
+   incomingCancelRequested = true;
+   transfer.cancelRequested = true;
+   setReceivingUI(false);
+   await cleanupPartialIncoming();
+   setStatus('recv-status', 'waiting', 'Trasferimento annullato ' + (d.by === 'sender' ? 'dal mittente.' : 'dal destinatario.'));
+   return;
+  }
+  if(d.t === 'ack') { resolveAck(d.id); return; }
+  if(d.t === 'text') {
+   showReceivedText(safeText(d.v));
+   setStatus('recv-status','success','📝 Testo ricevuto!');
+   return;
+  }
+  if(d.t === 'text-cmp') {
+   const text = await maybeDecodeTextBuffer(toArrayBuffer(d.data), d.cmp || null);
+   showReceivedText(text);
+   setStatus('recv-status','success','📝 Testo ricevuto!');
+   return;
+  }
+  if(d.t === 'text-sec') {
+   encryptedTextQueue.push({ cipher: toArrayBuffer(d.data), iv: new Uint8Array(d.iv || []), cmp: d.cmp || null });
+   updateUnlockPrompt();
+   return;
+  }
+  if(d.t === 'fs') {
+   ignoreIncomingBinary = false;
+   incomingCancelRequested = false;
+   transfer.cancelRequested = false;
+   setReceivingUI(true);
+   currentIncoming = {
+    id: d.id,
+    name: safeText(d.name),
+    size: Number(d.size || 0),
+    payloadSize: Number(d.payloadSize || d.size || 0),
+    mime: safeText(d.mime) || 'application/octet-stream',
+    enc: !!d.enc,
+    cmp: d.cmp || null,
+    ivBase: d.ivBase ? new Uint8Array(d.ivBase) : null,
+    chunkSize: Number(d.chunkSize || getActiveChunkSize()),
+    totalChunks: Number(d.totalChunks || chunkCountFor(Number(d.payloadSize || d.size || 0), Number(d.chunkSize || getActiveChunkSize()))),
+    transferBytes: Number(d.transferBytes || d.payloadSize || d.size || 0),
+    chunks: [],
+    received: 0
+   };
+   setStatus('recv-status','info', `Ricezione: ${currentIncoming.name} (${fmtSize(currentIncoming.size)})` + (currentIncoming.enc ? ' · cifrato' : '') + (currentIncoming.cmp ? ' · compresso' : ''));
+   return;
+  }
+  if(d.t === 'fe') {
+   if(!currentIncoming || currentIncoming.id !== d.id) return;
+   const doneFile = currentIncoming;
+   currentIncoming = null;
+   c.send({t:'ack', id:d.id});
+   if(doneFile.enc) {
+    encryptedFileQueue.push(doneFile);
+    updateUnlockPrompt();
+   } else {
+    await finalizeIncomingFile(doneFile);
+   }
+   return;
+  }
+  if(d.t === 'done') {
+   setReceivingUI(false);
+   if(encryptedFileQueue.length || encryptedTextQueue.length) updateUnlockPrompt();
+   else setStatus('recv-status','success', '🎉 Trasferimento completo!');
+  }
+ }
+ window.unlockFiles = async () => {
+  const password = $('recv-pw-input').value;
+  if(!(encryptedFileQueue.length || encryptedTextQueue.length)) return;
+  if(!password) {
+   $('pw-error').style.display = 'block';
+   $('pw-error').textContent = 'Inserisci la password';
+   setTimeout(() => { $('pw-error').style.display = 'none'; $('pw-error').textContent = 'Password errata!'; }, 2000);
+   return;
+  }
+  if(!recvSecurity.salt) { setStatus('recv-status','error','Metadati di cifratura mancanti.'); return; }
+  try {
+   const key = await deriveKeyFromPassword(password, recvSecurity.salt, recvSecurity.iterations);
+   await verifyPasswordForPending(key);
+   await unlockEncryptedText(key);
+   await unlockEncryptedFiles(key);
+   $('pw-unlock').style.display = 'none';
+   $('recv-pw-input').value = '';
+   setStatus('recv-status', 'success', '🎉 Contenuti decifrati e pronti!');
+  } catch(err) {
+   console.error(err);
+   $('pw-error').style.display = 'block';
+   $('recv-pw-input').value = '';
+   setTimeout(() => $('pw-error').style.display = 'none', 2200);
+  }
+ };
+ window.switchTab = tab => {
+  $('tab-receive').classList.toggle('active', tab === 'receive');
+  $('tab-send').classList.toggle('active', tab === 'send');
+  $('panel-receive').style.display = tab === 'receive' ? 'block' : 'none';
+  $('panel-send').style.display = tab === 'send' ? 'block' : 'none';
+ };
+ window.switchMode = mode => {
+  sendMode = mode;
+  $('mode-file').classList.toggle('active', mode === 'file');
+  $('mode-text').classList.toggle('active', mode === 'text');
+  $('panel-file-mode').style.display = mode === 'file' ? 'block' : 'none';
+  $('panel-text-mode').style.display = mode === 'text' ? 'block' : 'none';
+ };
+ window.copyCode = async () => {
+  if(!myCode) return;
+  try { await navigator.clipboard.writeText(myCode); } catch(e) {}
+  const t = $('copy-toast');
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 1500);
+ };
+ function init() {
+  if(!peerCtor) {
+   setStatus('recv-status','error','PeerJS non disponibile.');
+   return;
+  }
   myCode = genCode();
   try {
-   peer = new Peer('dropcross-' + myCode.toLowerCase(), { config: { iceServers: getIceServers() } });
+   peer = new peerCtor('dropcross-' + myCode.toLowerCase(), createPeerConfig());
   } catch(e) {
    setStatus('recv-status','error','Connessione al server non riuscita. Apri l’HTML in un browser moderno.');
    return;
@@ -576,349 +908,10 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
   });
   peer.on('connection', handleIncoming);
  }
- window.switchTab = tab => {
-  $('tab-receive').classList.toggle('active', tab === 'receive');
-  $('tab-send').classList.toggle('active', tab === 'send');
-  $('panel-receive').style.display = tab === 'receive' ? 'block' : 'none';
-  $('panel-send').style.display = tab === 'send' ? 'block' : 'none';
- };
- window.switchMode = mode => {
-  sendMode = mode;
-  $('mode-file').classList.toggle('active', mode === 'file');
-  $('mode-text').classList.toggle('active', mode === 'text');
-  $('panel-file-mode').style.display = mode === 'file' ? 'block' : 'none';
-  $('panel-text-mode').style.display = mode === 'text' ? 'block' : 'none';
- };
- window.copyCode = async () => {
-  if(!myCode) return;
-  try { await navigator.clipboard.writeText(myCode); } catch(e) {}
-  const t = $('copy-toast');
-  t.classList.add('show');
-  setTimeout(() => t.classList.remove('show'), 1500);
- };
- window.pickSaveFolder = async () => {
-  if(!window.showDirectoryPicker) {
-   setStatus('recv-status', 'error', 'Il salvataggio diretto su disco non è supportato da questo browser.');
-   return;
-  }
-  try {
-   saveDirHandle = await window.showDirectoryPicker({mode:'readwrite'});
-   $('btn-clear-folder').style.display = 'inline-flex';
-   $('save-folder-status').textContent = 'Salvataggio diretto attivo: i file non protetti verranno scritti direttamente nella cartella scelta. I file protetti verranno memorizzati temporaneamente in forma cifrata e decifrati solo dopo l’inserimento della password, riducendo l’uso di memoria.';
-   const badge = document.createElement('div');
-   badge.className = 'path-badge';
-   badge.textContent = 'Cartella selezionata: ' + (saveDirHandle.name || 'cartella');
-   const path = $('save-folder-path');
-   path.textContent = '';
-   path.appendChild(badge);
-  } catch(e) {
-   if(e && e.name !== 'AbortError') setStatus('recv-status', 'error', 'Impossibile selezionare la cartella di salvataggio.');
-  }
- };
- window.clearSaveFolder = () => {
-  saveDirHandle = null;
-  $('btn-clear-folder').style.display = 'none';
-  $('save-folder-status').textContent = 'Modalità standard: i file vengono tenuti in memoria fino al download. Su browser compatibili puoi scegliere una cartella per salvare direttamente i file non protetti e, per i file protetti, archiviare temporaneamente i dati cifrati su disco riducendo l\'uso di RAM.';
-  $('save-folder-path').textContent = '';
- };
- async function waitForBufferedAmountLow() {
-  const dc = conn && conn.dataChannel;
-  if(!dc) return;
-  if(dc.bufferedAmount <= MAX_BUFFERED_AMOUNT) return;
-  await new Promise(resolve => {
-   let done = false;
-   const finish = () => {
-    if(done) return;
-    done = true;
-    if(dc.removeEventListener) dc.removeEventListener('bufferedamountlow', onLow);
-    resolve();
-   };
-   const onLow = () => finish();
-   try { dc.bufferedAmountLowThreshold = MAX_BUFFERED_AMOUNT / 2; } catch(e) {}
-   if(dc.addEventListener) dc.addEventListener('bufferedamountlow', onLow, {once:true});
-   const tick = () => {
-    if(!conn || !conn.open || transfer.cancelRequested) return finish();
-    if(dc.bufferedAmount <= MAX_BUFFERED_AMOUNT / 2) return finish();
-    setTimeout(tick, 25);
-   };
-   tick();
-  });
- }
- function waitForAck(fileId, timeout=30000) {
-  return new Promise((resolve) => {
-   const timer = setTimeout(() => {
-    pendingAcks.delete(fileId);
-    resolve(false);
-   }, timeout);
-   pendingAcks.set(fileId, () => {
-    clearTimeout(timer);
-    pendingAcks.delete(fileId);
-    resolve(true);
-   });
-  });
- }
- function resolveAck(fileId) { const fn = pendingAcks.get(fileId); if(fn) fn(); }
- async function createUniqueFileHandle(name) {
-  if(!saveDirHandle) return null;
-  const parts = name.split('.');
-  const ext = parts.length > 1 ? '.' + parts.pop() : '';
-  const base = parts.join('.') || name || 'file';
-  let candidate = name || 'file';
-  let i = 1;
-  while(true) {
-   try {
-    await saveDirHandle.getFileHandle(candidate);
-    candidate = `${base} (${i++})${ext}`;
-   } catch(e) {
-    const handle = await saveDirHandle.getFileHandle(candidate, {create:true});
-    return {handle, name:candidate};
-   }
-  }
- }
- async function createTempFileHandle(id) {
-  if(!saveDirHandle) return null;
-  let candidate = `.dropcross-${id}.part`;
-  let i = 1;
-  while(true) {
-   try {
-    await saveDirHandle.getFileHandle(candidate);
-    candidate = `.dropcross-${id}-${i++}.part`;
-   } catch(e) {
-    const handle = await saveDirHandle.getFileHandle(candidate, {create:true});
-    return {handle, name:candidate};
-   }
-  }
- }
- async function cleanupPartialIncoming() {
-  if(!currentIncoming) return;
-  try { if(currentIncoming.writer) await currentIncoming.writer.abort(); } catch(e) {}
-  try {
-   if(currentIncoming.tempName && saveDirHandle && saveDirHandle.removeEntry) {
-    await saveDirHandle.removeEntry(currentIncoming.tempName).catch(() => {});
-   }
-  } catch(e) {}
-  currentIncoming = null;
- }
- function resetReceivedState() {
-  recvSecurity.enabled = false;
-  recvSecurity.salt = null;
-  recvSecurity.iterations = PBKDF2_ITERATIONS;
-  encryptedFileQueue.length = 0;
-  encryptedTextQueue.length = 0;
-  currentIncoming = null;
-  ignoreIncomingBinary = false;
-  $('pw-unlock').style.display = 'none';
-  $('pw-error').style.display = 'none';
-  $('recv-pw-input').value = '';
-  clearChildren($('received-files'));
-  clearChildren($('received-texts'));
- }
- async function handleIncoming(c) {
-  conn = c;
-  resetReceivedState();
-  c.on('open', () => {
-   try { if(c.dataChannel) c.dataChannel.binaryType = 'arraybuffer'; } catch(e) {}
-   c.send({t:'ok'});
-   setStatus('recv-status','success','Connesso! In attesa del trasferimento...');
-  });
-  c.on('data', d => {
-   incomingQueue = incomingQueue.then(() => processIncomingData(c, d)).catch(err => {
-    console.error(err);
-    setStatus('recv-status', 'error', 'Errore durante la ricezione: ' + (err && err.message ? err.message : 'sconosciuto'));
-   });
-  });
-  c.on('close', async () => {
-   transfer.cancelRequested = false;
-   setReceivingUI(false);
-   await cleanupPartialIncoming();
-   setStatus('recv-status','waiting','Disconnesso. In attesa...');
-  });
- }
- async function processIncomingData(c, d) {
-  if(d instanceof Blob) d = await d.arrayBuffer();
-  if(d instanceof ArrayBuffer || ArrayBuffer.isView(d)) {
-   if(ignoreIncomingBinary || !currentIncoming) return;
-   const chunk = d instanceof ArrayBuffer ? new Uint8Array(d) : new Uint8Array(d.buffer, d.byteOffset, d.byteLength);
-   currentIncoming.received += chunk.byteLength;
-   if(currentIncoming.writer) await currentIncoming.writer.write(chunk);
-   else currentIncoming.chunks.push(chunk.slice());
-   const total = currentIncoming.transferBytes || currentIncoming.size;
-   const pct = total ? Math.min(100, Math.round((currentIncoming.received / total) * 100)) : 0;
-   setStatus('recv-status', 'info', `Ricezione: ${currentIncoming.name} — ${pct}%`);
-   return;
-  }
-  if(!d || typeof d !== 'object') return;
-  if(d.t === 'sec') {
-   recvSecurity.enabled = !!d.enabled;
-   recvSecurity.salt = d.salt ? new Uint8Array(d.salt) : null;
-   recvSecurity.iterations = d.iterations || PBKDF2_ITERATIONS;
-   if(recvSecurity.enabled) setStatus('recv-status','info','🔒 Trasferimento cifrato in arrivo...');
-   return;
-  }
-  if(d.t === 'cancel') {
-   ignoreIncomingBinary = true;
-   transfer.cancelRequested = true;
-   setReceivingUI(false);
-   await cleanupPartialIncoming();
-   setStatus('recv-status', 'waiting', 'Trasferimento annullato ' + (d.by === 'sender' ? 'dal mittente.' : 'dal destinatario.'));
-   return;
-  }
-  if(d.t === 'ack') { resolveAck(d.id); return; }
-  if(d.t === 'text') {
-   const text = safeText(d.v);
-   showReceivedText(text);
-   setStatus('recv-status','success','📝 Testo ricevuto!');
-   return;
-  }
-  if(d.t === 'text-sec') {
-   encryptedTextQueue.push({ cipher: toArrayBuffer(d.data), iv: new Uint8Array(d.iv || []), salt: recvSecurity.salt ? new Uint8Array(recvSecurity.salt) : null, iterations: recvSecurity.iterations });
-   updateUnlockPrompt();
-   return;
-  }
-  if(d.t === 'fs') {
-   ignoreIncomingBinary = false;
-   transfer.cancelRequested = false;
-   setReceivingUI(true);
-   currentIncoming = {
-    id: d.id, name: safeText(d.name), size: Number(d.size || 0), mime: safeText(d.mime) || 'application/octet-stream', enc: !!d.enc,
-    ivBase: d.ivBase ? new Uint8Array(d.ivBase) : null, chunkSize: Number(d.chunkSize || CHUNK),
-    totalChunks: Number(d.totalChunks || chunkCountFor(Number(d.size || 0), Number(d.chunkSize || CHUNK))),
-    transferBytes: Number(d.transferBytes || d.size || 0), chunks: [], received: 0, writer: null, tempHandle: null, tempName: null, finalName: safeText(d.name), savedDirect: false
-   };
-   if(currentIncoming.enc) {
-    if(saveDirHandle) {
-     try {
-      const temp = await createTempFileHandle(currentIncoming.id);
-      if(temp) {
-       currentIncoming.tempHandle = temp.handle;
-       currentIncoming.tempName = temp.name;
-       currentIncoming.writer = await temp.handle.createWritable();
-      }
-     } catch(e) {}
-    }
-   } else if(saveDirHandle) {
-    try {
-      const finalFile = await createUniqueFileHandle(currentIncoming.name);
-      if(finalFile) {
-       currentIncoming.finalName = finalFile.name;
-       currentIncoming.writer = await finalFile.handle.createWritable();
-       currentIncoming.savedDirect = true;
-      }
-     } catch(e) {}
-   }
-   setStatus('recv-status','info', `Ricezione: ${currentIncoming.name} (${fmtSize(currentIncoming.size)})` + (currentIncoming.enc ? ' · cifrato' : (currentIncoming.savedDirect ? ' · salvataggio diretto' : '')));
-   return;
-  }
-  if(d.t === 'fe') {
-   if(!currentIncoming || currentIncoming.id !== d.id) return;
-   const doneFile = currentIncoming;
-   if(doneFile.writer) await doneFile.writer.close();
-   if(doneFile.enc) {
-    encryptedFileQueue.push(doneFile);
-    updateUnlockPrompt();
-   } else if(doneFile.savedDirect) {
-    showFileDownload(doneFile.finalName || doneFile.name, doneFile.size, null, true);
-    setStatus('recv-status','success', `✅ File salvato: ${doneFile.finalName || doneFile.name}`);
-   } else {
-    const blob = new Blob(doneFile.chunks, {type: doneFile.mime || 'application/octet-stream'});
-    showFileDownload(doneFile.name, doneFile.size, blob, false);
-    setStatus('recv-status','success', `✅ File ricevuto: ${doneFile.name}`);
-   }
-   currentIncoming = null;
-   c.send({t:'ack', id:d.id});
-   return;
-  }
-  if(d.t === 'done') {
-   setReceivingUI(false);
-   if(encryptedFileQueue.length || encryptedTextQueue.length) updateUnlockPrompt();
-   else setStatus('recv-status','success', '🎉 Trasferimento completo!');
-  }
- }
- async function readEncryptedChunk(fileMeta, index) {
-  const expected = cipherChunkLength(fileMeta.size, fileMeta.chunkSize, index);
-  if(fileMeta.tempHandle) {
-   const file = await fileMeta.tempHandle.getFile();
-   let offset = 0;
-   for(let i = 0; i < index; i++) offset += cipherChunkLength(fileMeta.size, fileMeta.chunkSize, i);
-   return file.slice(offset, offset + expected).arrayBuffer();
-  }
-  return toArrayBuffer(fileMeta.chunks[index]);
- }
- async function verifyPasswordForPending(key) {
-  if(encryptedTextQueue.length) {
-   const sample = encryptedTextQueue[0];
-   await decryptTextPayload(key, sample.iv, sample.cipher);
-   return;
-  }
-  if(encryptedFileQueue.length) {
-   const sampleFile = encryptedFileQueue[0];
-   const firstChunk = await readEncryptedChunk(sampleFile, 0);
-   await decryptChunk(key, sampleFile.ivBase, 0, firstChunk);
-  }
- }
- async function unlockEncryptedText(key) {
-  for(const item of encryptedTextQueue) showReceivedText(await decryptTextPayload(key, item.iv, item.cipher));
-  encryptedTextQueue.length = 0;
- }
- async function unlockEncryptedFiles(key) {
-  for(const fileMeta of [...encryptedFileQueue]) {
-   if(fileMeta.tempHandle && saveDirHandle) {
-    const finalFile = await createUniqueFileHandle(fileMeta.name);
-    const writer = await finalFile.handle.createWritable();
-    try {
-      for(let i = 0; i < fileMeta.totalChunks; i++) {
-       const cipherChunk = await readEncryptedChunk(fileMeta, i);
-       const plain = await decryptChunk(key, fileMeta.ivBase, i, cipherChunk);
-       await writer.write(new Uint8Array(plain));
-      }
-      await writer.close();
-      showFileDownload(finalFile.name, fileMeta.size, null, true);
-      if(saveDirHandle.removeEntry && fileMeta.tempName) await saveDirHandle.removeEntry(fileMeta.tempName).catch(() => {});
-     } catch(err) {
-      try { await writer.abort(); } catch(e) {}
-      throw err;
-     }
-   } else {
-    const plainChunks = [];
-    for(let i = 0; i < fileMeta.totalChunks; i++) {
-     const cipherChunk = await readEncryptedChunk(fileMeta, i);
-     const plain = await decryptChunk(key, fileMeta.ivBase, i, cipherChunk);
-     plainChunks.push(new Uint8Array(plain));
-    }
-    const blob = new Blob(plainChunks, {type:fileMeta.mime || 'application/octet-stream'});
-    showFileDownload(fileMeta.name, fileMeta.size, blob, false);
-   }
-  }
-  encryptedFileQueue.length = 0;
- }
- window.unlockFiles = async () => {
-  const password = $('recv-pw-input').value;
-  if(!(encryptedFileQueue.length || encryptedTextQueue.length)) return;
-  if(!password) {
-   $('pw-error').style.display = 'block';
-   $('pw-error').textContent = 'Inserisci la password';
-   setTimeout(() => { $('pw-error').style.display = 'none'; $('pw-error').textContent = 'Password errata!'; }, 2000);
-   return;
-  }
-  if(!recvSecurity.salt) { setStatus('recv-status','error','Metadati di cifratura mancanti.'); return; }
-  try {
-   const key = await deriveKeyFromPassword(password, recvSecurity.salt, recvSecurity.iterations);
-   await verifyPasswordForPending(key);
-   await unlockEncryptedText(key);
-   await unlockEncryptedFiles(key);
-   $('pw-unlock').style.display = 'none';
-   $('recv-pw-input').value = '';
-   setStatus('recv-status', 'success', '🎉 Contenuti decifrati e pronti!');
-  } catch(err) {
-   console.error(err);
-   $('pw-error').style.display = 'block';
-   $('recv-pw-input').value = '';
-   setTimeout(() => $('pw-error').style.display = 'none', 2200);
-  }
- };
  window.connectPeer = async () => {
   const code = $('peer-code').value.replace(/[^A-Za-z0-9]/g,'').toUpperCase();
   if(code.length !== 6) { setStatus('send-status','error','Inserisci 6 caratteri'); return; }
+  if(!peerCtor) { setStatus('send-status','error','PeerJS non disponibile.'); return; }
   const btn = $('btn-connect');
   btn.disabled = true;
   const target = 'dropcross-' + code.toLowerCase();
@@ -929,7 +922,7 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
    setStatus('send-status','info', attempt > 0 ? `Tentativo ${attempt+1} di ${MAX_RETRIES}...` : 'Connessione in corso...');
    const result = await new Promise(resolve => {
     let senderPeerLocal;
-    try { senderPeerLocal = new Peer(undefined, { config: { iceServers: getIceServers() } }); }
+    try { senderPeerLocal = new peerCtor(undefined, createPeerConfig()); }
     catch(e) { resolve('fail'); return; }
     let settled = false;
     const timeout = setTimeout(() => {
@@ -947,14 +940,17 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
       settled = true;
       conn = c;
       sendPeer = senderPeerLocal;
-      try { if(conn.dataChannel) conn.dataChannel.binaryType = 'arraybuffer'; } catch(e) {}
+      senderReady = false;
+      tuneConnection(c);
       c.on('data', d => {
        if(d && typeof d === 'object') {
         if(d.t === 'ok') {
+         senderReady = true;
+         tuneConnection(c);
          btn.textContent = '✓ Connesso';
          btn.style.background = 'var(--ok)';
          $('file-card').style.display = 'block';
-         setStatus('send-status','success','Connesso! Seleziona i contenuti da inviare.');
+         setStatus('send-status','success', `Connesso! Chunk dinamico: ${getActiveChunkSize()} B.`);
         } else if(d.t === 'ack') resolveAck(d.id);
         else if(d.t === 'cancel') {
          transfer.cancelRequested = true;
@@ -969,6 +965,7 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
        btn.disabled = false;
        btn.textContent = 'Connetti';
        btn.style.background = '';
+       senderReady = false;
        setStatus('send-status','waiting','Disconnesso.');
       });
       resolve('ok');
@@ -1004,15 +1001,20 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
   setStatus('send-status','error','Connessione non riuscita dopo 3 tentativi. Verifica la rete e riprova.');
  };
  window.sendText = async () => {
-  if(!conn || !conn.open || transfer.sending) return;
+  if(!conn || !conn.open || transfer.sending || !senderReady) return;
   const text = $('send-text').value;
   if(!text.trim()) { setStatus('send-status','error','Inserisci del testo da inviare'); return; }
   const pw = $('send-password').value;
   const sec = await prepareSendSecurity(pw);
+  const inputBuffer = textEncoder.encode(text).buffer;
+  const maybeCompressed = await maybeCompressTextBuffer(inputBuffer);
   if(sec.enabled) {
-   const payload = await encryptTextPayload(sec.key, text);
-   conn.send({t:'text-sec', iv:Array.from(payload.iv), data:new Uint8Array(payload.cipher)});
-   setStatus('send-status','success', '📝 Testo cifrato inviato!');
+   const payload = await encryptBufferPayload(sec.key, maybeCompressed.buffer);
+   conn.send({t:'text-sec', iv:Array.from(payload.iv), data:new Uint8Array(payload.cipher), cmp:maybeCompressed.cmp || null});
+   setStatus('send-status','success', '📝 Testo cifrato inviato!' + (maybeCompressed.cmp ? ' (compresso)' : ''));
+  } else if(maybeCompressed.cmp) {
+   conn.send({t:'text-cmp', data:new Uint8Array(maybeCompressed.buffer), cmp:maybeCompressed.cmp});
+   setStatus('send-status','success', '📝 Testo inviato! (compresso)');
   } else {
    conn.send({t:'text', v:text});
    setStatus('send-status','success', '📝 Testo inviato!');
@@ -1029,13 +1031,42 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
   renderFiles();
  };
  window.removeFile = i => { files.splice(i, 1); renderFiles(); };
+ async function prepareFilePayload(file) {
+  const originalChunkSize = getActiveChunkSize();
+  const baselineTransferBytes = transfer.totalBytes;
+  let payloadBlob = file;
+  let cmp = null;
+  if(isCompressibleFile(file)) {
+   setStatus('send-status', 'info', `Preparazione: compressione di ${file.name}...`);
+   const compressed = await maybeCompressFile(file);
+   payloadBlob = compressed.blob;
+   cmp = compressed.cmp;
+  }
+  const chunkSize = getActiveChunkSize();
+  const payloadSize = Number(payloadBlob.size || 0);
+  const transferBytes = payloadSize ? (Number($('send-password').value ? 1 : 0) ? computeEncryptedTransferBytes(payloadSize, chunkSize) : payloadSize) : 0;
+  return {
+   name: file.name,
+   mime: file.type || 'application/octet-stream',
+   displaySize: file.size,
+   payloadBlob,
+   payloadSize,
+   cmp,
+   chunkSize,
+   totalChunks: chunkCountFor(payloadSize, chunkSize),
+   transferBytes,
+   baselineTransferBytes,
+   originalChunkSize
+  };
+ }
  window.sendAll = async () => {
-  if(!conn || !conn.open || !files.length || transfer.sending) return;
+  if(!conn || !conn.open || !files.length || transfer.sending || !senderReady) return;
+  tuneConnection(conn);
   const pw = $('send-password').value;
   const sec = await prepareSendSecurity(pw);
   transfer.cancelRequested = false;
   transfer.sentBytes = 0;
-  transfer.totalBytes = files.reduce((sum, f) => sum + (sec.enabled ? (f.size + 16 * chunkCountFor(f.size, CHUNK)) : f.size), 0);
+  transfer.totalBytes = files.reduce((sum, f) => sum + (sec.enabled ? computeEncryptedTransferBytes(f.size, getActiveChunkSize()) : f.size), 0);
   transfer.startedAt = Date.now();
   setSendingUI(true);
   resetProgress();
@@ -1043,43 +1074,59 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
   let completed = 0;
   let cancelled = false;
   for(let i = 0; i < files.length; i++) {
-   const before = transfer.sentBytes;
    const file = files[i];
-   const totalChunks = chunkCountFor(file.size, CHUNK);
-   const fileTransferBytes = sec.enabled ? (file.size + 16 * totalChunks) : file.size;
+   if(transfer.cancelRequested) { cancelled = true; break; }
+   const estimatedBefore = sec.enabled ? computeEncryptedTransferBytes(file.size, getActiveChunkSize()) : file.size;
+   const prepared = await prepareFilePayload(file);
+   transfer.totalBytes += (prepared.transferBytes - estimatedBefore);
+   const before = transfer.sentBytes;
    const ok = await (async () => {
     const fileId = makeUniqueId();
     transfer.currentFileId = fileId;
     transfer.currentFileName = file.name;
     const enc = !!sec.enabled;
     const ivBase = enc ? makeIvBase() : null;
-    conn.send({t:'fs', id:fileId, name:file.name, size:file.size, mime:file.type || 'application/octet-stream', enc, ivBase: ivBase ? Array.from(ivBase) : null, chunkSize: CHUNK, totalChunks, transferBytes:fileTransferBytes});
+    conn.send({
+     t:'fs',
+     id:fileId,
+     name:prepared.name,
+     size:prepared.displaySize,
+     payloadSize:prepared.payloadSize,
+     mime:prepared.mime,
+     cmp: prepared.cmp || null,
+     enc,
+     ivBase: ivBase ? Array.from(ivBase) : null,
+     chunkSize: prepared.chunkSize,
+     totalChunks: prepared.totalChunks,
+     transferBytes: enc ? computeEncryptedTransferBytes(prepared.payloadSize, prepared.chunkSize) : prepared.payloadSize
+    });
     let offset = 0;
     let chunkIndex = 0;
     let fileSent = 0;
-    while(offset < file.size) {
-      if(transfer.cancelRequested) return false;
-      const end = Math.min(offset + CHUNK, file.size);
-      const plainChunk = await file.slice(offset, end).arrayBuffer();
-      let payload = plainChunk;
-      let accounted = plainChunk.byteLength;
-      if(enc) {
-       payload = await encryptChunk(sec.key, ivBase, chunkIndex, plainChunk);
-       accounted = plainChunk.byteLength + 16;
-      }
-      await waitForBufferedAmountLow();
-      if(transfer.cancelRequested) return false;
-      conn.send(payload);
-      offset = end;
-      chunkIndex++;
-      fileSent += accounted;
-      transfer.sentBytes = before + fileSent;
-      updateSendProgress(transfer.sentBytes, transfer.totalBytes, `${i + 1}/${files.length}: ${file.name}`);
-      await new Promise(r => setTimeout(r, 0));
+    while(offset < prepared.payloadSize) {
+     if(transfer.cancelRequested) return false;
+     const end = Math.min(offset + prepared.chunkSize, prepared.payloadSize);
+     const plainChunk = await prepared.payloadBlob.slice(offset, end).arrayBuffer();
+     let payload = plainChunk;
+     let accounted = plainChunk.byteLength;
+     if(enc) {
+      payload = await encryptChunk(sec.key, ivBase, chunkIndex, plainChunk);
+      accounted = plainChunk.byteLength + 16;
+     }
+     await waitForBufferedAmountLow(conn);
+     if(transfer.cancelRequested) return false;
+     conn.send(payload);
+     offset = end;
+     chunkIndex++;
+     fileSent += accounted;
+     transfer.sentBytes = before + fileSent;
+     updateSendProgress(transfer.sentBytes, transfer.totalBytes, `${i + 1}/${files.length}: ${file.name}` + (prepared.cmp ? ' · gzip' : ''));
+     await new Promise(r => setTimeout(r, 0));
     }
+    if(prepared.payloadSize === 0) updateSendProgress(transfer.sentBytes, transfer.totalBytes, `${i + 1}/${files.length}: ${file.name}`);
     conn.send({t:'fe', id:fileId});
-    const acked = await waitForAck(fileId, 30000);
-    if(acked) transfer.sentBytes = before + fileTransferBytes;
+    const acked = await waitForAck(fileId, 45000);
+    if(acked) transfer.sentBytes = before + (enc ? computeEncryptedTransferBytes(prepared.payloadSize, prepared.chunkSize) : prepared.payloadSize);
     return acked && !transfer.cancelRequested;
    })();
    if(!ok) { cancelled = true; break; }
@@ -1107,6 +1154,7 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
   try { conn.send({t:'cancel', by:who}); } catch(e) {}
   if(who === 'receiver') {
    ignoreIncomingBinary = true;
+   incomingCancelRequested = true;
    await cleanupPartialIncoming();
    setReceivingUI(false);
    setStatus('recv-status', 'waiting', 'Ricezione annullata.');
