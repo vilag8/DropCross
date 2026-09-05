@@ -316,12 +316,78 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
  function getActiveChunkSize(){ return conn ? (conn.__dropcrossChunkSize || computeTransferChunkSize(conn)) : DEFAULT_CHUNK; }
  function createPeerConfig(){
   return {
+   // I log PeerJS aiutano a distinguere signaling, ICE e DataChannel.
+   debug: 2,
    config: {
     iceServers: [...STUN_SERVERS, ...OPTIONAL_TURN],
-    iceCandidatePoolSize: 8,
+    // "all" prova prima il percorso diretto e usa TURN quando disponibile.
+    iceTransportPolicy: 'all',
+    iceCandidatePoolSize: 4,
+    bundlePolicy: 'max-bundle',
+    rtcpMuxPolicy: 'require',
     sdpSemantics: 'unified-plan'
    }
   };
+ }
+ function describeRtcError(err){
+  const type = err && err.type ? err.type : '';
+  const message = err && err.message ? err.message : '';
+  if(type === 'peer-unavailable') return 'Codice non trovato o ricevente non online.';
+  if(type === 'network' || type === 'socket-error' || type === 'socket-closed') return 'Server di collegamento non raggiungibile.';
+  if(type === 'webrtc') return 'WebRTC non ha trovato un percorso di rete. Controlla firewall/VPN o configura un TURN affidabile.';
+  return message || type || 'errore sconosciuto';
+ }
+ function monitorRtcConnection(c, role){
+  if(!c) return;
+  const pc = c.peerConnection;
+  if(!pc) {
+   console.warn('[DropCross][' + role + '] RTCPeerConnection non ancora disponibile');
+   return;
+  }
+  const logState = eventName => console.info('[DropCross][' + role + '] ' + eventName, {
+   connectionState: pc.connectionState,
+   iceConnectionState: pc.iceConnectionState,
+   iceGatheringState: pc.iceGatheringState,
+   signalingState: pc.signalingState
+  });
+  pc.addEventListener('connectionstatechange', () => logState('connectionstatechange'));
+  pc.addEventListener('iceconnectionstatechange', () => logState('iceconnectionstatechange'));
+  pc.addEventListener('icegatheringstatechange', () => logState('icegatheringstatechange'));
+  pc.addEventListener('signalingstatechange', () => logState('signalingstatechange'));
+  pc.addEventListener('icecandidateerror', ev => console.warn('[DropCross][' + role + '] ICE candidate error', {
+   url: ev.url, errorCode: ev.errorCode, errorText: ev.errorText
+  }));
+  pc.addEventListener('icecandidate', ev => {
+   if(!ev.candidate) return;
+   const candidate = ev.candidate;
+   console.info('[DropCross][' + role + '] ICE candidate', {
+    type: candidate.type,
+    protocol: candidate.protocol,
+    address: candidate.address || '(protetto dal browser)',
+    port: candidate.port
+   });
+  });
+  const reportSelectedPair = async () => {
+   try {
+    const stats = await pc.getStats();
+    let pair;
+    stats.forEach(r => {
+     if(r.type === 'candidate-pair' && (r.selected || r.nominated && r.state === 'succeeded')) pair = r;
+    });
+    if(!pair) return;
+    const local = stats.get(pair.localCandidateId);
+    const remote = stats.get(pair.remoteCandidateId);
+    console.info('[DropCross][' + role + '] percorso selezionato', {
+     localType: local && local.candidateType,
+     remoteType: remote && remote.candidateType,
+     protocol: local && local.protocol,
+     relayProtocol: local && local.relayProtocol
+    });
+   } catch(err) { console.warn('[DropCross][' + role + '] statistiche ICE non disponibili', err); }
+  };
+  pc.addEventListener('connectionstatechange', () => {
+   if(pc.connectionState === 'connected') reportSelectedPair();
+  });
  }
  function setStatus(id, type, msg) {
   const host = $(id);
@@ -720,6 +786,7 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
   conn = c;
   senderReady = false;
   tuneConnection(c);
+  monitorRtcConnection(c, 'ricevente');
   resetReceivedState();
   c.on('open', () => {
    senderReady = true;
@@ -733,8 +800,13 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
     setStatus('recv-status', 'error', 'Errore durante la ricezione: ' + (err && err.message ? err.message : 'sconosciuto'));
    });
   });
+  c.on('error', err => {
+   console.error('[DropCross][ricevente] errore connessione', err);
+   setStatus('recv-status','error','Errore di connessione: ' + describeRtcError(err));
+  });
   c.on('close', async () => {
    transfer.cancelRequested = false;
+   senderReady = false;
    setReceivingUI(false);
    await cleanupPartialIncoming();
    setStatus('recv-status','waiting','Disconnesso. In attesa...');
@@ -916,7 +988,8 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
   btn.disabled = true;
   const target = 'dropcross-' + code.toLowerCase();
   const MAX_RETRIES = 3;
-  const TIMEOUTS = [10000, 15000, 20000];
+  // TURN su TCP può richiedere più tempo rispetto a una connessione locale/UDP.
+  const TIMEOUTS = [20000, 30000, 45000];
   for(let attempt = 0; attempt < MAX_RETRIES; attempt++) {
    btn.textContent = attempt > 0 ? `Tentativo ${attempt+1}/${MAX_RETRIES}...` : 'Connessione...';
    setStatus('send-status','info', attempt > 0 ? `Tentativo ${attempt+1} di ${MAX_RETRIES}...` : 'Connessione in corso...');
@@ -934,6 +1007,7 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
     }, TIMEOUTS[attempt]);
     senderPeerLocal.on('open', () => {
      const c = senderPeerLocal.connect(target, { reliable:true, serialization:'default' });
+     monitorRtcConnection(c, 'mittente');
      c.on('open', () => {
       if(settled) return;
       clearTimeout(timeout);
@@ -970,16 +1044,19 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
       });
       resolve('ok');
      });
-     c.on('error', () => {
+     c.on('error', err => {
+      console.error('[DropCross][mittente] errore connessione', err);
+      setStatus('send-status','error','Tentativo fallito: ' + describeRtcError(err));
       if(!settled) {
        settled = true;
        clearTimeout(timeout);
        try { senderPeerLocal.destroy(); } catch(e) {}
-       resolve('retry');
+       resolve(err && err.type === 'peer-unavailable' ? 'not-found' : 'retry');
       }
      });
     });
     senderPeerLocal.on('error', err => {
+     console.error('[DropCross][mittente] errore PeerJS', err);
      if(!settled) {
       settled = true;
       clearTimeout(timeout);
@@ -998,7 +1075,7 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
   }
   btn.disabled = false;
   btn.textContent = 'Connetti';
-  setStatus('send-status','error','Connessione non riuscita dopo 3 tentativi. Verifica la rete e riprova.');
+  setStatus('send-status','error','Connessione non riuscita. Disattiva temporaneamente VPN/firewall oppure configura un server TURN affidabile. Dettagli nella console del browser.');
  };
  window.sendText = async () => {
   if(!conn || !conn.open || transfer.sending || !senderReady) return;
@@ -1164,6 +1241,15 @@ footer{padding:20px 0 10px;text-align:center;color:var(--tx3);font-size:.72rem}
   }
  };
  $('peer-code').addEventListener('input', function(){ this.value = this.value.toUpperCase().replace(/[^A-HJKLMNP-Z2-9]/g,''); });
+ window.addEventListener('offline', () => {
+  setStatus('recv-status','error','Dispositivo offline. Verifica la connessione Internet.');
+  setStatus('send-status','error','Dispositivo offline. Verifica la connessione Internet.');
+ });
+ window.addEventListener('online', () => {
+  if(peer && !peer.destroyed && peer.disconnected) {
+   try { peer.reconnect(); } catch(e) {}
+  }
+ });
  init();
 })();
 </script>
